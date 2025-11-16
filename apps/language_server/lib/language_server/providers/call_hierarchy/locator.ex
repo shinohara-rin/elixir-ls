@@ -225,6 +225,10 @@ defmodule ElixirLS.LanguageServer.Providers.CallHierarchy.Locator do
     }
   end
 
+  defp wrap_atom({nil, other}), do: {nil, other}
+  defp wrap_atom({atom, other}) when is_atom(atom), do: {{:atom, atom}, other}
+  defp wrap_atom(other), do: other
+
   defp expand({nil, func}, _env, module, _aliases) when module != nil,
     do: {nil, func}
 
@@ -294,13 +298,50 @@ defmodule ElixirLS.LanguageServer.Providers.CallHierarchy.Locator do
     else
       all_calls = metadata.calls |> Map.values() |> List.flatten()
 
+      mods_funs = metadata.mods_funs_to_positions
+      metadata_types = metadata.types
+
       filtered_calls =
         all_calls
+        # Filter out calls with nil function (anonymous function calls)
+        |> Enum.filter(fn call -> call.func != nil end)
         |> Enum.filter(fn call ->
-          # Check for the specific function, module and arity
-          call.func == function and
-            call.mod == module and
-            (arity == :any or call.arity == arity)
+          # Get environment at call position to expand variables and attributes
+          {call_line, call_column} = call.position
+          env = Metadata.get_cursor_env(metadata, {call_line, call_column || 1})
+
+          binding_env = Binding.from_env(env, metadata, call.position)
+
+          # Determine the module for local calls
+          mod_or_nil =
+            case call.kind do
+              :local_function -> nil
+              :local_macro -> nil
+              _ -> call.mod
+            end
+
+          # Expand variables and attributes to get actual module and function
+          found =
+            {mod_or_nil, call.func}
+            |> wrap_atom
+            |> expand(binding_env, env.module, env.aliases)
+            |> Introspection.actual_mod_fun(
+              env,
+              mods_funs,
+              metadata_types,
+              call.position,
+              false
+            )
+
+          # Check if this call matches our target
+          case found do
+            {^module, ^function, true, :mod_fun} ->
+              # Check arity
+              arity == :any or call.arity == arity
+
+            _ ->
+              false
+          end
         end)
 
       group_calls_by_caller(filtered_calls, metadata)
@@ -500,25 +541,61 @@ defmodule ElixirLS.LanguageServer.Providers.CallHierarchy.Locator do
                 (end_line == nil or call_line <= end_line)
             end)
 
-          # Group by callee
+          # Expand calls to resolve variables and attributes, then group by callee
           calls
-          |> Enum.group_by(fn call ->
-            # For local calls (mod == nil), use the module from the current context
-            callee_mod = call.mod || module
-            {callee_mod, call.func, call.arity}
+          # Filter out calls where func is not an atom (e.g., anonymous functions)
+          # ElixirSense can produce calls where func is a tuple (AST) for anonymous function calls
+          |> Enum.filter(fn call -> is_atom(call.func) end)
+          |> Enum.flat_map(fn call ->
+            # Get environment at call position to expand variables and attributes
+            {call_line, call_column} = call.position
+            env = Metadata.get_cursor_env(metadata, {call_line, call_column || 1})
+
+            binding_env = Binding.from_env(env, metadata, call.position)
+
+            # Expand variables and attributes to get actual module
+            {expanded_mod, expanded_fun} =
+              {call.mod, call.func}
+              |> wrap_atom
+              |> expand(binding_env, env.module, env.aliases)
+
+            # For outgoing calls, include the call if we could expand the module/function
+            # or if it's already a concrete module (even if not in metadata)
+            case {expanded_mod, expanded_fun} do
+              {nil, nil} ->
+                # Couldn't expand - skip this call
+                []
+
+              {actual_mod, actual_fun} when is_atom(actual_mod) and is_atom(actual_fun) ->
+                # Successfully resolved to a module and function
+                [{actual_mod, actual_fun, call.arity, call}]
+
+              {nil, actual_fun} when is_atom(actual_fun) ->
+                # Local call without module - use the module from the function parameter
+                [{module, actual_fun, call.arity, call}]
+
+              _ ->
+                []
+            end
           end)
-          |> Enum.map(fn {{mod, fun, call_arity}, calls} ->
+          |> Enum.group_by(fn {mod, fun, call_arity, _call} ->
+            {mod, fun, call_arity}
+          end)
+          |> Enum.map(fn {{mod, fun, call_arity}, expanded_calls} ->
+            # Extract original calls from the expanded tuples
+            original_calls = Enum.map(expanded_calls, fn {_, _, _, call} -> call end)
+
             %{
               to: %{
                 name: "#{inspect(mod)}.#{fun}/#{call_arity}",
                 kind: GenLSP.Enumerations.SymbolKind.function(),
                 uri: nil,
-                range: build_range_from_call(List.first(calls)),
-                selection_range: build_range_from_call(List.first(calls)),
+                range: build_range_from_call(List.first(original_calls)),
+                selection_range: build_range_from_call(List.first(original_calls)),
                 tags: [],
                 detail: nil
               },
-              from_ranges: Enum.map(calls, &build_range_from_call/1)
+              from_ranges: Enum.map(original_calls, &build_range_from_call/1)
             }
           end)
         else
