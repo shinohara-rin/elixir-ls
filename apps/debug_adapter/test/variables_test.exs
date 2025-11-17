@@ -200,14 +200,31 @@ defmodule ElixirLS.DebugAdapter.VariablesTest do
     end
 
     test "port" do
-      children = Variables.children(hd(:erlang.ports()), 0, 10)
+      # Create our own port for testing instead of relying on system ports
+      # which may have non-deterministic ordering
+      # Use a simple command that exists on all platforms
+      command =
+        case :os.type() do
+          {:win32, _} -> ~c"cmd"
+          _ -> ~c"cat"
+        end
 
-      case :os.type() do
-        {:win32, _} ->
-          assert children[:name] == ~c"2/2"
+      port = :erlang.open_port({:spawn, command}, [:binary])
 
-        _ ->
-          assert children[:name] == ~c"forker"
+      try do
+        children = Variables.children(port, 0, 10)
+
+        # Verify we can extract port info - the specific name may vary by OS
+        # but it should be a charlist matching our command
+        assert children[:name] == command
+        assert is_list(children[:name])
+        assert Enum.all?(children[:name], &is_integer/1)
+
+        # Verify other common port info fields exist
+        assert is_integer(children[:id])
+        assert is_pid(children[:connected])
+      after
+        Port.close(port)
       end
     end
   end
