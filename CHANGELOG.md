@@ -1,6 +1,6 @@
 ### Unreleased
 
-### v0.30.0: 16 November 2025
+### v0.30.0: 17 November 2025
 
 #### Highlights
 
@@ -16,6 +16,7 @@
 - Added workaround for elixir crash when formatting test failure in debug adapter
 - Added support for elixir 1.19 `not in` token format
 - Ported upstream improvements to `dbg` macro support in debug adapter
+- Dialyxir dependency updated to 1.4.7
 
 #### Fixes
 
